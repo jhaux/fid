@@ -17,12 +17,12 @@ from scipy import linalg
 import pathlib
 import urllib
 import warnings
-
 from tqdm import tqdm
 
 from edflow.iterators.batches import make_batches
 from edflow.data.util import adjust_support
 from edflow.util import retrieve
+tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
 
 def create_inception_graph(pth):
@@ -139,11 +139,12 @@ def calculate_activation_statistics(images, sess, batch_size=50, verbose=False):
 #------------------
 
 
-def get_activations_from_dset(dset, sess, batch_size=50, imkey='image', verbose=False):
+def get_activations_from_dset(dset, imsupport, sess, batch_size=50, imkey='image', verbose=False):
     """Calculates the activations of the pool_3 layer for all images.
 
     Params:
     -- dset        : DatasetMixin which contains the images.
+    -- imsupport   : Support of images. One of '-1->1', '0->1' or '0->255'
     -- sess        : current session
     -- batch_size  : the images numpy array is split into batches with batch size
                      batch_size. A reasonable batch size depends on the disposable hardware.
@@ -177,22 +178,28 @@ def get_activations_from_dset(dset, sess, batch_size=50, imkey='image', verbose=
         start = i*batch_size
         end = start + batch_size
         images = retrieve(batch, imkey)
-        images = adjust_support(np.array(images), '0->255', clip=True)
+        images = adjust_support(np.array(images),
+                future_support='0->255',
+                current_support=imsupport,
+                clip=True)
         images = images.astype(np.float32)[..., :3]
+
+        if images.shape[-1] == 1:
+            images = np.tile(images, [1,1,1,3])
 
         if len(pred_arr[start:end]) == 0:
             continue
 
         pred = sess.run(inception_layer, {'FID_Inception_Net/ExpandDims:0': images})
         pred_arr[start:end] = pred.reshape(batch_size,-1)
-        del batch #clean up memory
+        del batch  # clean up memory
 
     if verbose:
         print(" done")
     return pred_arr
 
     
-def calculate_activation_statistics_from_dset(dset, sess, batch_size=50, imkey='image', verbose=False):
+def calculate_activation_statistics_from_dset(dset, imsupport, sess, batch_size=50, imkey='image', verbose=False):
     """Calculation of the statistics used by the FID.
     Params:
     -- dset        : DatasetMixin which contains the images.
@@ -208,19 +215,20 @@ def calculate_activation_statistics_from_dset(dset, sess, batch_size=50, imkey='
     -- sigma : The covariance matrix of the activations of the pool_3 layer of
                the incption model.
     """
-    act = get_activations_from_dset(dset, sess, batch_size, imkey, verbose)
+    act = get_activations_from_dset(dset, imsupport, sess, batch_size, imkey, verbose)
     mu = np.mean(act, axis=0)
     sigma = np.cov(act, rowvar=False)
     return mu, sigma
     
 #-------------------------------------------------------------------------------
 
-
 #-------------------------------------------------------------------------------
 # The following functions aren't needed for calculating the FID
 # they're just here to make this module work as a stand-alone script
 # for calculating FID scores
 #-------------------------------------------------------------------------------
+
+
 def check_or_download_inception(inception_path):
     ''' Checks if the path to the inception file is valid, or downloads
         the file if it is not present. '''
@@ -239,57 +247,116 @@ def check_or_download_inception(inception_path):
     return str(model_file)
 
 
-def calculate_fid_given_dsets(dsets, imkeys, inception_path,
-                              batch_size=50):
+def calculate_fid_given_dsets(dsets, imsupports, imkeys, inception_path,
+                              batch_size=50, save_data_in_path=None):
     ''' Calculates the FID of two paths. '''
     inception_path = check_or_download_inception(inception_path)
-
     create_inception_graph(str(inception_path))
 
-    with tf.Session() as sess:
+    sess_config = tf.ConfigProto()
+    sess_config.gpu_options.allow_growth = True
+    with tf.Session(config=sess_config) as sess:
         sess.run(tf.global_variables_initializer())
 
         m1, s1 = calculate_activation_statistics_from_dset(
-                dsets[0], sess, batch_size, imkeys[0]
+                dsets[0], imsupports[0], sess, batch_size, imkeys[0]
                 )
+        if save_data_in_path is not None:
+            print('\nSaved input data statistics to {}'.format(save_data_in_path))
+            np.savez(save_data_in_path, mu=m1, sigma=s1)
         m2, s2 = calculate_activation_statistics_from_dset(
-                dsets[1], sess, batch_size, imkeys[1]
-                )
+                dsets[1], imsupports[1], sess, batch_size, imkeys[1])
 
         fid_value = calculate_frechet_distance(m1, s1, m2, s2)
-
         return fid_value
 
 
+def calculate_fid_given_npz_and_dset(npz_path, dsets, imsupports, imkeys, inception_path,
+                              batch_size=50):
+    ''' Calculates the FID where data statistics is given in npz and evaluation in dataset. '''
+    inception_path = check_or_download_inception(inception_path)
+    create_inception_graph(str(inception_path))
+
+    sess_config = tf.ConfigProto()
+    sess_config.gpu_options.allow_growth = True
+    with tf.Session(config=sess_config) as sess:
+        sess.run(tf.global_variables_initializer())
+        assert npz_path.endswith('.npz')
+        f = np.load(npz_path)
+        m1, s1 = f['mu'][:], f['sigma'][:]
+        f.close()
+        m2, s2 = calculate_activation_statistics_from_dset(dsets[1],
+                imsupports[1], sess, batch_size, imkeys[1])
+        fid_value = calculate_frechet_distance(m1, s1, m2, s2)
+        return fid_value
+
+
+def calculate_fid_from_npz_if_available(npz_path, dsets, imsupports, imkeys, inception_path,
+                              batch_size=50):
+    try:
+        # calculate from npz
+        print('\nFound a .npz file, loading from it...')
+        fid_value = calculate_fid_given_npz_and_dset(npz_path, dsets,
+                imsupports, imkeys, inception_path, batch_size=batch_size)
+    except FileNotFoundError:
+        # if not possible to calculate from npz, calc from input data and save to npz
+        os.makedirs(os.path.split(npz_path)[0], exist_ok=True)
+        fid_value = calculate_fid_given_dsets(dsets, imsupports, imkeys, inception_path, batch_size=batch_size,
+                                              save_data_in_path=npz_path[:-4])
+        print('\nNo npz file found, calculating statistics from data...')
+    return fid_value
+
+
 def fid(root, data_in, data_out, config,
-        im_in_key='image', im_out_key='image', name='fid'):
+        im_in_key='image', im_out_key='image',
+        im_in_support=None, im_out_support=None,
+        name='fid'):
 
     incept_p = os.environ.get(
             'INCEPTION_PATH', 
             '/export/scratch/jhaux/Models/inception_fid'
             )
+
     inception_path = retrieve(config, 'fid/inception_path', default=incept_p)
-
     batch_size = retrieve(config, 'fid/batch_size', default=50)
+    pre_calc_stat_path = retrieve(config, 'fid_stats/pre_calc_stat_path', default='none')
+    fid_iterations = retrieve(config, 'fid/fid_iterations', default=1)
 
-    fid_value = calculate_fid_given_dsets(
-            [data_in, data_out],
-            [im_in_key, im_out_key],
-            inception_path,
-            batch_size)
+    save_dir = os.path.join(root, name)
+    os.makedirs(save_dir, exist_ok=True)
+    fids = []
+    for ii in range(fid_iterations):
+        if pre_calc_stat_path is not 'none':
+            print('\nLoading pre-calculated statistics from {} if available.'.format(pre_calc_stat_path))
+            fid_value = calculate_fid_from_npz_if_available(pre_calc_stat_path, [data_in, data_out],
+                    [im_in_support, im_out_support],
+                    [im_in_key, im_out_key],
+                    inception_path,
+                    batch_size)
+        else:
+            print('\nNo path of pre-calculated statistics specified. Falling back to default behavior.')
+            fid_value = calculate_fid_given_dsets(
+                    [data_in, data_out],
+                    [im_in_support, im_out_support],
+                    [im_in_key, im_out_key],
+                    inception_path,
+                    batch_size,
+                    save_data_in_path=os.path.join(save_dir, 'pre_calc_stats'))
+        fids.append(fid_value)
 
     if 'model_output.csv' in root:
         root = root[:-len('model_output.csv')]
+    savename_score = os.path.join(save_dir, 'score.txt')
+    savename_std = os.path.join(save_dir, 'std.txt')
 
-    save_dir = os.path.join(root, name)
-    savename = os.path.join(save_dir, 'score.txt')
+    fid_score = np.array(fids).mean()
+    fid_std = np.array(fids).std()
+    with open(savename_score, 'w+') as f:
+        f.write(str(fid_score))
+    with open(savename_std, 'w+') as f:
+        f.write(str(fid_std))
+    print('\nFID SCORE: {:.2f} +/- {:.2f}'.format(fid_score, fid_std))
 
-    os.makedirs(save_dir, exist_ok=True)
-
-    with open(savename, 'w+') as f:
-        f.write(str(fid_value))
-
-    print('\nFID SCORE: {}'.format(fid_value))
 
 if __name__ == "__main__":
     from edflow.debug import DebugDataset
